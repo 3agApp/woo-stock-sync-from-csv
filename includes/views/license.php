@@ -429,7 +429,7 @@ if ($is_active) {
                         <?php 
                         printf(
                             esc_html__('Updates are fetched from %s', 'woo-stock-sync'),
-                            '<a href="https://github.com/3AG-App/woo-stock-sync-from-csv/releases" target="_blank">GitHub Releases</a>'
+                            '<a href="https://github.com/3agApp/woo-stock-sync-from-csv/releases" target="_blank">GitHub Releases</a>'
                         ); 
                         ?>
                     </p>
