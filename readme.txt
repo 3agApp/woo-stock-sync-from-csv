@@ -6,7 +6,7 @@ Tested up to: 6.4
 Requires PHP: 7.4
 WC requires at least: 5.0
 WC tested up to: 8.0
-Stable tag: 1.4.11
+Stable tag: 1.4.12
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -63,6 +63,10 @@ Yes, the plugin supports both simple products and product variations. Each varia
 You can configure this in Settings. Options include: ignore (keep current stock), set stock to 0, or make the product private (and restore when it returns).
 
 == Changelog ==
+
+= 1.4.12 =
+* Fixed: When the same SKU was used by more than one product (e.g. multilingual duplicates from WPML/Polylang), only one product was updated per sync and the others kept their old stock. Sync now updates every product carrying the SKU, in both the CSV-matched batch path and the "Set missing SKUs to 0" path.
+* Changed: Internal — `wssc_privatized_products` now stores a list of product IDs per SKU. Old single-ID entries are still read for backward compatibility.
 
 = 1.4.11 =
 * Added: Debug page (Stock Sync → Debug) showing per-SKU values across the CSV, postmeta, HPOS lookup table, and the WooCommerce product API. Includes per-product "Clear caches" and "Force update to CSV value" actions.

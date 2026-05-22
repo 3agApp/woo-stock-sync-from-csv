@@ -351,37 +351,39 @@ class WSSC_Sync {
             foreach ($batch as $sku => $quantity) {
                 $this->stats['processed']++;
 
-                if (!isset($products[$sku])) {
+                if (empty($products[$sku])) {
                     $this->stats['not_found']++;
                     continue;
                 }
 
-                $product_data = $products[$sku];
-                $product_id = $product_data['id'];
-                $current_stock = $product_data['stock'];
-                $lookup_stock = $product_data['lookup_stock'];
-                $manages_stock = $product_data['manages_stock'];
-                $post_status = $product_data['post_status'];
+                // A SKU can be shared by multiple posts (multilingual duplicates,
+                // accidental copies, etc.). Update every product carrying this SKU,
+                // not just one.
+                foreach ($products[$sku] as $product_data) {
+                    $product_id = $product_data['id'];
+                    $current_stock = $product_data['stock'];
+                    $lookup_stock = $product_data['lookup_stock'];
+                    $manages_stock = $product_data['manages_stock'];
+                    $post_status = $product_data['post_status'];
 
-                // Check if product is private and should be restored to public
-                if ($should_restore_private && $post_status === 'private') {
-                    $products_to_publish[] = $product_id;
+                    if ($should_restore_private && $post_status === 'private') {
+                        $products_to_publish[] = $product_id;
+                    }
+
+                    // Skip only when both postmeta and HPOS lookup already equal the CSV value.
+                    // If they disagree, the row has drifted — force an update so both get repaired.
+                    $postmeta_matches = $current_stock !== null && (int) $current_stock === $quantity;
+                    $lookup_matches = $lookup_stock === null || (int) $lookup_stock === $quantity;
+                    if ($postmeta_matches && $lookup_matches) {
+                        $this->stats['skipped']++;
+                        continue;
+                    }
+
+                    $this->update_stock_direct($product_id, $quantity, $manages_stock);
+                    $this->stats['updated']++;
                 }
-
-                // Skip only when both postmeta and HPOS lookup already equal the CSV value.
-                // If they disagree, the row has drifted — force an update so both get repaired.
-                $postmeta_matches = $current_stock !== null && (int) $current_stock === $quantity;
-                $lookup_matches = $lookup_stock === null || (int) $lookup_stock === $quantity;
-                if ($postmeta_matches && $lookup_matches) {
-                    $this->stats['skipped']++;
-                    continue;
-                }
-
-                // Update stock via direct SQL
-                $this->update_stock_direct($product_id, $quantity, $manages_stock);
-                $this->stats['updated']++;
             }
-            
+
             $wpdb->query('COMMIT');
             
         } catch (Exception $e) {
@@ -396,7 +398,13 @@ class WSSC_Sync {
         }
         
         // Clear caches once per batch (not per product)
-        $this->clear_product_caches(array_column($products, 'id'));
+        $all_ids = [];
+        foreach ($products as $sku_products) {
+            foreach ($sku_products as $product_data) {
+                $all_ids[] = $product_data['id'];
+            }
+        }
+        $this->clear_product_caches($all_ids);
     }
     
     /**
@@ -527,8 +535,13 @@ class WSSC_Sync {
 
         $results = $wpdb->get_results($query);
 
+        // A SKU can be shared by multiple posts (multilingual duplicates, etc.),
+        // so collect every matching product under the SKU key.
         foreach ($results as $row) {
-            $products[$row->sku] = [
+            if (!isset($products[$row->sku])) {
+                $products[$row->sku] = [];
+            }
+            $products[$row->sku][] = [
                 'id' => intval($row->id),
                 'stock' => $row->stock !== null ? intval($row->stock) : null,
                 'lookup_stock' => isset($row->lookup_stock) && $row->lookup_stock !== null ? intval($row->lookup_stock) : null,
@@ -613,38 +626,40 @@ class WSSC_Sync {
         if ($action === 'private') {
             $returned_skus = array_intersect(array_keys($privatized_by_plugin), $csv_skus);
             foreach ($returned_skus as $sku) {
-                $product_id = $privatized_by_plugin[$sku];
-                $product = wc_get_product($product_id);
-                
-                if ($product && $product->get_status() === 'private') {
-                    // Restore to publish - use WC methods to trigger hooks
-                    $product->set_status('publish');
-                    $product->set_catalog_visibility('visible');
-                    $product->save();
-                    
-                    $this->stats['missing_restored']++;
-                    unset($privatized_by_plugin[$sku]);
+                // Old data may have stored a single int; normalize to an array.
+                $ids = is_array($privatized_by_plugin[$sku]) ? $privatized_by_plugin[$sku] : [$privatized_by_plugin[$sku]];
+                foreach ($ids as $product_id) {
+                    $product = wc_get_product($product_id);
+                    if ($product && $product->get_status() === 'private') {
+                        $product->set_status('publish');
+                        $product->set_catalog_visibility('visible');
+                        $product->save();
+
+                        $this->stats['missing_restored']++;
+                    }
                 }
+                unset($privatized_by_plugin[$sku]);
             }
             update_option('wssc_privatized_products', $privatized_by_plugin);
         }
-        
+
         if (empty($missing_skus)) {
             return;
         }
-        
+
         // Process missing products
         // For 'zero' action, use optimized direct SQL
         if ($action === 'zero') {
             $wpdb->query('START TRANSACTION');
             try {
                 foreach ($missing_skus as $sku) {
-                    if (!isset($store_products[$sku])) {
+                    if (empty($store_products[$sku])) {
                         continue;
                     }
-                    $product_id = $store_products[$sku];
-                    $this->update_stock_direct($product_id, 0, true);
-                    $this->stats['missing_set_zero']++;
+                    foreach ($store_products[$sku] as $product_id) {
+                        $this->update_stock_direct($product_id, 0, true);
+                        $this->stats['missing_set_zero']++;
+                    }
                 }
                 $wpdb->query('COMMIT');
             } catch (Exception $e) {
@@ -652,43 +667,45 @@ class WSSC_Sync {
                 $this->error_messages[] = $e->getMessage();
             }
         }
-        
+
         // For 'private' action, use WC methods to trigger hooks
         if ($action === 'private') {
             foreach ($missing_skus as $sku) {
-                if (!isset($store_products[$sku])) {
+                if (empty($store_products[$sku])) {
                     continue;
                 }
-                
-                $product_id = $store_products[$sku];
-                
-                try {
-                    $product = wc_get_product($product_id);
-                    
-                    if (!$product) {
-                        continue;
+
+                foreach ($store_products[$sku] as $product_id) {
+                    try {
+                        $product = wc_get_product($product_id);
+
+                        if (!$product) {
+                            continue;
+                        }
+
+                        if ($product->get_status() !== 'private') {
+                            $product->set_status('private');
+                            $product->set_catalog_visibility('hidden');
+                            $product->save();
+
+                            if (!isset($privatized_by_plugin[$sku]) || !is_array($privatized_by_plugin[$sku])) {
+                                $privatized_by_plugin[$sku] = [];
+                            }
+                            $privatized_by_plugin[$sku][] = $product_id;
+                            $this->stats['missing_set_private']++;
+                        }
+
+                    } catch (Exception $e) {
+                        $this->error_messages[] = sprintf(
+                            __('Error setting SKU %s (#%d) to private: %s', 'woo-stock-sync'),
+                            $sku,
+                            $product_id,
+                            $e->getMessage()
+                        );
                     }
-                    
-                    // Set to private if not already - use WC methods to trigger hooks
-                    if ($product->get_status() !== 'private') {
-                        $product->set_status('private');
-                        $product->set_catalog_visibility('hidden');
-                        $product->save();
-                        
-                        // Track that we privatized this product
-                        $privatized_by_plugin[$sku] = $product_id;
-                        $this->stats['missing_set_private']++;
-                    }
-                    
-                } catch (Exception $e) {
-                    $this->error_messages[] = sprintf(
-                        __('Error setting SKU %s to private: %s', 'woo-stock-sync'),
-                        $sku,
-                        $e->getMessage()
-                    );
                 }
             }
-            
+
             update_option('wssc_privatized_products', $privatized_by_plugin);
         }
     }
@@ -713,11 +730,15 @@ class WSSC_Sync {
         ";
         
         $results = $wpdb->get_results($query);
-        
+
+        // Each SKU maps to a list of product IDs to handle duplicates.
         foreach ($results as $row) {
-            $products[$row->sku] = intval($row->post_id);
+            if (!isset($products[$row->sku])) {
+                $products[$row->sku] = [];
+            }
+            $products[$row->sku][] = intval($row->post_id);
         }
-        
+
         return $products;
     }
     
@@ -876,18 +897,24 @@ class WSSC_Sync {
         }
         
         $cleaned = [];
-        
-        foreach ($privatized_by_plugin as $sku => $product_id) {
-            $product = wc_get_product($product_id);
-            
-            // Keep only if product exists and is still private
-            if ($product && $product->get_status() === 'private') {
-                $cleaned[$sku] = $product_id;
+
+        foreach ($privatized_by_plugin as $sku => $value) {
+            // Old data may have stored a single int; normalize to an array.
+            $ids = is_array($value) ? $value : [$value];
+            $kept = [];
+            foreach ($ids as $product_id) {
+                $product = wc_get_product($product_id);
+                if ($product && $product->get_status() === 'private') {
+                    $kept[] = intval($product_id);
+                }
+            }
+            if (!empty($kept)) {
+                $cleaned[$sku] = $kept;
             }
         }
-        
+
         // Only update option if something changed
-        if (count($cleaned) !== count($privatized_by_plugin)) {
+        if ($cleaned !== $privatized_by_plugin) {
             update_option('wssc_privatized_products', $cleaned);
         }
         
