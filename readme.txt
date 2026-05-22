@@ -6,7 +6,7 @@ Tested up to: 6.4
 Requires PHP: 7.4
 WC requires at least: 5.0
 WC tested up to: 8.0
-Stable tag: 1.4.8
+Stable tag: 1.4.10
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -63,6 +63,9 @@ Yes, the plugin supports both simple products and product variations. Each varia
 You can configure this in Settings. Options include: ignore (keep current stock), set stock to 0, or make the product private (and restore when it returns).
 
 == Changelog ==
+
+= 1.4.10 =
+* Fixed: Sync skipped products when `_stock` postmeta and the HPOS `wc_product_meta_lookup` table had drifted out of sync, leaving the admin display unchanged. Sync now compares against both sources and repairs drifted rows automatically.
 
 = 1.4.8 =
 * Version bump

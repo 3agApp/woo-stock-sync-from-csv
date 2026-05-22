@@ -350,29 +350,33 @@ class WSSC_Sync {
         try {
             foreach ($batch as $sku => $quantity) {
                 $this->stats['processed']++;
-                
+
                 if (!isset($products[$sku])) {
                     $this->stats['not_found']++;
                     continue;
                 }
-                
+
                 $product_data = $products[$sku];
                 $product_id = $product_data['id'];
                 $current_stock = $product_data['stock'];
+                $lookup_stock = $product_data['lookup_stock'];
                 $manages_stock = $product_data['manages_stock'];
                 $post_status = $product_data['post_status'];
-                
+
                 // Check if product is private and should be restored to public
                 if ($should_restore_private && $post_status === 'private') {
                     $products_to_publish[] = $product_id;
                 }
-                
-                // Skip if stock is already the same
-                if ($current_stock !== null && (int) $current_stock === $quantity) {
+
+                // Skip only when both postmeta and HPOS lookup already equal the CSV value.
+                // If they disagree, the row has drifted — force an update so both get repaired.
+                $postmeta_matches = $current_stock !== null && (int) $current_stock === $quantity;
+                $lookup_matches = $lookup_stock === null || (int) $lookup_stock === $quantity;
+                if ($postmeta_matches && $lookup_matches) {
                     $this->stats['skipped']++;
                     continue;
                 }
-                
+
                 // Update stock via direct SQL
                 $this->update_stock_direct($product_id, $quantity, $manages_stock);
                 $this->stats['updated']++;
@@ -489,37 +493,50 @@ class WSSC_Sync {
         
         $placeholders = array_fill(0, count($skus), '%s');
         $placeholders_str = implode(',', $placeholders);
-        
-        // Get SKU, ID, stock, manage_stock, and post_status in one query
+
+        // Detect HPOS product meta lookup table and join it in when present so we can
+        // compare against the same source WooCommerce uses for admin/listing queries.
+        $lookup_table = $wpdb->prefix . 'wc_product_meta_lookup';
+        $has_lookup = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $lookup_table)) === $lookup_table;
+
+        $lookup_select = $has_lookup ? ", lookup.stock_quantity as lookup_stock" : ", NULL as lookup_stock";
+        $lookup_join = $has_lookup
+            ? "LEFT JOIN {$lookup_table} lookup ON sku.post_id = lookup.product_id"
+            : "";
+
+        // Get SKU, ID, stock, manage_stock, lookup stock, and post_status in one query
         $query = $wpdb->prepare(
-            "SELECT 
-                sku.meta_value as sku, 
+            "SELECT
+                sku.meta_value as sku,
                 sku.post_id as id,
                 stock.meta_value as stock,
                 manage.meta_value as manages_stock,
                 p.post_status
+                {$lookup_select}
              FROM {$wpdb->postmeta} sku
              INNER JOIN {$wpdb->posts} p ON sku.post_id = p.ID
              LEFT JOIN {$wpdb->postmeta} stock ON sku.post_id = stock.post_id AND stock.meta_key = '_stock'
              LEFT JOIN {$wpdb->postmeta} manage ON sku.post_id = manage.post_id AND manage.meta_key = '_manage_stock'
-             WHERE sku.meta_key = '_sku' 
+             {$lookup_join}
+             WHERE sku.meta_key = '_sku'
              AND sku.meta_value IN ($placeholders_str)
              AND p.post_type IN ('product', 'product_variation')
              AND p.post_status IN ('publish', 'private')",
             $skus
         );
-        
+
         $results = $wpdb->get_results($query);
-        
+
         foreach ($results as $row) {
             $products[$row->sku] = [
                 'id' => intval($row->id),
                 'stock' => $row->stock !== null ? intval($row->stock) : null,
+                'lookup_stock' => isset($row->lookup_stock) && $row->lookup_stock !== null ? intval($row->lookup_stock) : null,
                 'manages_stock' => $row->manages_stock === 'yes',
                 'post_status' => $row->post_status,
             ];
         }
-        
+
         return $products;
     }
     
