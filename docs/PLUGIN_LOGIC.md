@@ -1,6 +1,6 @@
 # WooCommerce Stock Sync from CSV - Plugin Logic Documentation
 
-**Version:** 1.4.6  
+**Version:** 1.4.9
 **Last Updated:** February 2026
 
 ---
@@ -110,32 +110,25 @@ foreach ($batch as $sku => $quantity) {
     // 1. Get product data (ID, current stock, post_status)
     // 2. If setting is 'private' AND product is private → queue for restore
     // 3. Skip if stock is already the same
-    // 4. Update stock via direct SQL (fast)
+    // 4. Update stock via WooCommerce stock helpers
 }
 
 // After batch: restore queued products to public
 restore_products_to_public($products_to_publish);
 ```
 
-### Stock Update (`update_stock_direct`)
+### Stock Update (`update_stock`)
 
-Uses direct SQL for 10-15x faster performance:
+Uses WooCommerce stock helpers so stock quantity, stock status, lookup tables,
+hooks, and caches stay in sync:
 
-```sql
--- Update _stock meta
-UPDATE wp_postmeta SET meta_value = $qty WHERE post_id = $id AND meta_key = '_stock'
-
--- Update _stock_status meta
-UPDATE wp_postmeta SET meta_value = 'instock'|'outofstock' WHERE ...
-
--- Update HPOS lookup table (if exists)
-UPDATE wp_wc_product_meta_lookup SET stock_quantity = $qty, stock_status = ...
+```php
+wc_update_product_stock($product, $qty, 'set');
+wc_update_product_stock_status($product_id, $qty > 0 ? 'instock' : 'outofstock');
+wc_update_product_lookup_tables($product_id);
 ```
 
-**Why direct SQL?**
-- `$product->save()` triggers hooks, cache clears, and additional queries per product
-- For 4000+ products, this caused 30+ second sync times
-- Direct SQL reduces to 2-4 seconds
+This is less aggressive than raw SQL, but avoids stale product data after syncs.
 
 ---
 
@@ -163,7 +156,7 @@ get_option('wssc_missing_sku_action', 'ignore'); // Returns: 'ignore', 'zero', o
 2. Get all SKUs from WooCommerce store (published + private products)
 3. Find MISSING = Store SKUs - CSV SKUs
 4. For each missing SKU:
-   - If action == 'zero': update_stock_direct($id, 0)
+   - If action == 'zero': update_stock($id, 0)
    - If action == 'private': 
      - $product->set_status('private')
      - $product->set_catalog_visibility('hidden')
@@ -448,7 +441,7 @@ $should_restore = ($action === 'private');
 │ 1. Find product by SKU                   │
 │ 2. If private + setting='private' → queue│
 │ 3. Skip if stock unchanged               │
-│ 4. Update stock (direct SQL)             │
+│ 4. Update stock (WC stock helpers)       │
 └────────┬─────────────────────────────────┘
          │
          ▼ After batch
@@ -544,6 +537,7 @@ wp cron event list
 
 | Version | Key Changes |
 |---------|-------------|
+| 1.4.9 | Stock updates use WooCommerce helpers; Test/Preview respect SSL checkbox |
 | 1.2.6 | Code review fixes: uninstall cleanup, scheduled sync lock, SQL prepare, orphan cleanup |
 | 1.2.5 | Smart scheduling - settings save no longer resets valid schedules |
 | 1.2.4 | Fixed catalog visibility on restore (visible instead of hidden) |

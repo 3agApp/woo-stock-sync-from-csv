@@ -6,7 +6,7 @@ Tested up to: 6.4
 Requires PHP: 7.4
 WC requires at least: 5.0
 WC tested up to: 8.0
-Stable tag: 1.4.8
+Stable tag: 1.4.9
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -63,6 +63,10 @@ Yes, the plugin supports both simple products and product variations. Each varia
 You can configure this in Settings. Options include: ignore (keep current stock), set stock to 0, or make the product private (and restore when it returns).
 
 == Changelog ==
+
+= 1.4.9 =
+* Fixed: Stock sync now uses WooCommerce stock helpers so quantity, stock status, lookup tables, hooks, and caches stay in sync
+* Fixed: Test Connection and Preview now respect the current SSL verification checkbox value
 
 = 1.4.8 =
 * Version bump

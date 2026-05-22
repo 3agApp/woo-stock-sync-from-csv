@@ -409,7 +409,10 @@
             $btn.prop('disabled', true)
                 .html('<span class="wssc-spinner"></span> ' + wssc_admin.strings.testing);
 
-            this.ajax('wssc_test_connection', { url: url })
+            this.ajax('wssc_test_connection', {
+                url: url,
+                disable_ssl: $('#wssc-disable-ssl').is(':checked')
+            })
                 .done(function (response) {
                     if (response.success) {
                         WSSC.toast(response.data.message, 'success');
@@ -440,7 +443,10 @@
             const $btn = $('#wssc-preview-csv');
             $btn.prop('disabled', true);
 
-            this.ajax('wssc_preview_csv', { url: url })
+            this.ajax('wssc_preview_csv', {
+                url: url,
+                disable_ssl: $('#wssc-disable-ssl').is(':checked')
+            })
                 .done(function (response) {
                     if (response.success) {
                         WSSC.showPreviewModal(response.data);

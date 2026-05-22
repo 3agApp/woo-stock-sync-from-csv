@@ -112,6 +112,7 @@ class WSSC_Ajax {
         }
         
         $url = isset($_POST['url']) ? esc_url_raw($_POST['url']) : '';
+        $disable_ssl = isset($_POST['disable_ssl']) && $_POST['disable_ssl'] === 'true';
         
         if (empty($url)) {
             wp_send_json_error([
@@ -119,7 +120,7 @@ class WSSC_Ajax {
             ]);
         }
         
-        $result = WSSC()->sync->test_connection($url);
+        $result = WSSC()->sync->test_connection($url, $disable_ssl);
         
         if ($result['success']) {
             wp_send_json_success($result);
@@ -142,6 +143,7 @@ class WSSC_Ajax {
         }
         
         $url = isset($_POST['url']) ? esc_url_raw($_POST['url']) : '';
+        $disable_ssl = isset($_POST['disable_ssl']) && $_POST['disable_ssl'] === 'true';
         
         if (empty($url)) {
             wp_send_json_error([
@@ -149,7 +151,7 @@ class WSSC_Ajax {
             ]);
         }
         
-        $result = WSSC()->sync->preview_columns($url);
+        $result = WSSC()->sync->preview_columns($url, $disable_ssl);
         
         if ($result['success']) {
             wp_send_json_success($result);
