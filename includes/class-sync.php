@@ -16,16 +16,28 @@ class WSSC_Sync {
      * Batch size for processing
      */
     const BATCH_SIZE = 100;
-    
+
+    /**
+     * Maximum wall-clock seconds a single sync run may take before it stops
+     * processing remaining batches. Acts as a zombie-killer so a stuck run can
+     * never live for hours. Override with the 'wssc_max_runtime' filter.
+     */
+    const MAX_RUNTIME = 1200;
+
     /**
      * Current sync stats (initialized via get_default_stats())
      */
     private $stats = [];
-    
+
     /**
      * Error messages
      */
     private $error_messages = [];
+
+    /**
+     * Memoized result of the HPOS product meta lookup table existence check.
+     */
+    private $has_lookup_table = null;
     
     /**
      * Constructor
@@ -36,22 +48,13 @@ class WSSC_Sync {
     }
     
     /**
-     * Run scheduled sync (with lock to prevent concurrent runs)
+     * Run scheduled sync.
+     *
+     * Concurrency is guarded centrally inside run() via the single-run lock, so both
+     * the scheduled and manual paths share one choke point.
      */
     public function run_scheduled_sync() {
-        // Check if already running
-        if (WSSC()->scheduler->is_running()) {
-            return;
-        }
-        
-        // Set running lock
-        WSSC()->scheduler->set_running(true);
-        
-        try {
-            $this->run('scheduled');
-        } finally {
-            WSSC()->scheduler->set_running(false);
-        }
+        $this->run('scheduled');
     }
     
     /**
@@ -81,9 +84,39 @@ class WSSC_Sync {
     }
     
     /**
-     * Main sync process
+     * Main sync process.
+     *
+     * Acquires a single-run lock up front so overlapping scheduled/manual syncs can
+     * never stack up (the original cause of the MySQL query pile-up). The lock is
+     * always released afterwards, including on early returns and CSV failures.
      */
     public function run($trigger = 'manual') {
+        // Single-run guard shared by every entry point (cron, AJAX, WP-CLI).
+        if (!WSSC()->scheduler->acquire_lock()) {
+            WSSC()->logs->add([
+                'type'    => 'sync',
+                'trigger' => $trigger,
+                'status'  => 'warning',
+                'message' => __('Sync skipped — another sync is already running.', 'woo-stock-sync'),
+            ]);
+
+            return [
+                'success' => false,
+                'message' => __('A sync is already in progress.', 'woo-stock-sync'),
+            ];
+        }
+
+        try {
+            return $this->execute_run($trigger);
+        } finally {
+            WSSC()->scheduler->release_lock();
+        }
+    }
+
+    /**
+     * Execute a single sync run. Always called while holding the single-run lock.
+     */
+    private function execute_run($trigger) {
         // Reset stats for this run
         $this->stats = $this->get_default_stats();
         $this->error_messages = [];
@@ -114,8 +147,9 @@ class WSSC_Sync {
         $this->stats['start_time'] = microtime(true);
         $this->stats['trigger'] = $trigger;
         
-        // Set up error handling
-        set_time_limit(0);
+        // Bound runtime so a single run can never live indefinitely. PHP's own timer
+        // is refreshed per batch (below) rather than being disabled outright.
+        $max_runtime = (int) apply_filters('wssc_max_runtime', self::MAX_RUNTIME);
         wp_raise_memory_limit('admin');
         
         // Fetch CSV
@@ -136,26 +170,59 @@ class WSSC_Sync {
         
         $this->stats['total_rows'] = count($parsed['data']);
         
-        // Process in batches
+        // Process in batches, honoring the wall-clock budget.
         $batches = array_chunk($parsed['data'], self::BATCH_SIZE, true);
-        
+
+        $time_capped = false;
         foreach ($batches as $batch) {
+            if ((microtime(true) - $this->stats['start_time']) > $max_runtime) {
+                $time_capped = true;
+                break;
+            }
+
+            // Keep PHP's execution timer alive per batch without disabling it globally.
+            if (function_exists('set_time_limit')) {
+                @set_time_limit(120);
+            }
+
             $this->process_batch($batch);
         }
-        
-        // Handle missing SKU action (products in store but not in CSV)
+
+        // Handle missing SKU action (products in store but not in CSV).
+        // Skip entirely when the run was time-capped: the catalog view is incomplete,
+        // so we must not zero/privatize products we simply never reached this run.
         $missing_sku_action = get_option('wssc_missing_sku_action', 'ignore');
-        if ($missing_sku_action !== 'ignore') {
+        if (!$time_capped && $missing_sku_action !== 'ignore') {
             $this->process_missing_skus($parsed['data'], $missing_sku_action);
         }
-        
+
+        // Flush WooCommerce product transients once for the whole run (per-product
+        // object caches were already cleared per batch).
+        wc_delete_product_transients();
+
         // Finalize
         $this->stats['end_time'] = microtime(true);
         $duration = round($this->stats['end_time'] - $this->stats['start_time'], 2);
-        
-        // Log the sync
-        $this->log_sync($trigger, true, null, $duration);
-        
+
+        if ($time_capped) {
+            WSSC()->logs->add([
+                'type'    => 'sync',
+                'trigger' => $trigger,
+                'status'  => 'warning',
+                'message' => sprintf(
+                    /* translators: 1: runtime limit in seconds, 2: rows processed, 3: total rows */
+                    __('Sync stopped after reaching the %1$ds runtime limit. Processed %2$d of %3$d rows; the rest will sync on the next run.', 'woo-stock-sync'),
+                    $max_runtime,
+                    $this->stats['processed'],
+                    $this->stats['total_rows']
+                ),
+                'stats'   => $this->stats,
+            ]);
+        } else {
+            // Log the sync
+            $this->log_sync($trigger, true, null, $duration);
+        }
+
         // Re-schedule next sync
         WSSC()->scheduler->reschedule();
         
@@ -471,11 +538,9 @@ class WSSC_Sync {
         );
         
         // Update HPOS lookup table if it exists
-        $lookup_table = $wpdb->prefix . 'wc_product_meta_lookup';
-        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-        if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $lookup_table)) === $lookup_table) {
+        if ($this->has_lookup_table()) {
             $wpdb->update(
-                $lookup_table,
+                $wpdb->prefix . 'wc_product_meta_lookup',
                 [
                     'stock_quantity' => $quantity,
                     'stock_status' => $stock_status,
@@ -488,44 +553,158 @@ class WSSC_Sync {
     }
     
     /**
-     * Get product IDs by SKUs with current stock values (optimized)
+     * Whether the WooCommerce HPOS product meta lookup table exists.
+     *
+     * Memoized for the request so the SHOW TABLES probe runs at most once instead of
+     * on every batch and every per-product stock write.
+     *
+     * @return bool
+     */
+    private function has_lookup_table() {
+        global $wpdb;
+
+        if ($this->has_lookup_table === null) {
+            $lookup_table = $wpdb->prefix . 'wc_product_meta_lookup';
+            $this->has_lookup_table = $wpdb->get_var(
+                $wpdb->prepare("SHOW TABLES LIKE %s", $lookup_table)
+            ) === $lookup_table;
+        }
+
+        return $this->has_lookup_table;
+    }
+
+    /**
+     * Get product IDs by SKUs with current stock values.
+     *
+     * On HPOS sites (the common case) this drives SKU resolution off the indexed
+     * `sku` column of wp_wc_product_meta_lookup instead of scanning the unindexed
+     * `wp_postmeta.meta_value`. The remaining detail (postmeta _stock / _manage_stock,
+     * post status) is fetched by primary/post_id key, so every query is index-backed.
+     * Falls back to the legacy postmeta-driven query when the lookup table is absent.
+     *
+     * @param string[] $skus
+     * @return array<string, array<int, array>> SKU => list of matching product rows.
      */
     private function get_products_by_skus_with_stock($skus) {
-        global $wpdb;
-        
-        $products = [];
-        
         if (empty($skus)) {
+            return [];
+        }
+
+        if ($this->has_lookup_table()) {
+            return $this->get_products_by_skus_via_lookup($skus);
+        }
+
+        return $this->get_products_by_skus_via_postmeta($skus);
+    }
+
+    /**
+     * Index-backed SKU resolution via the HPOS lookup table.
+     */
+    private function get_products_by_skus_via_lookup($skus) {
+        global $wpdb;
+
+        $products = [];
+        $lookup_table = $wpdb->prefix . 'wc_product_meta_lookup';
+        $placeholders = implode(',', array_fill(0, count($skus), '%s'));
+
+        // 1. Resolve SKU -> product_id off the indexed `sku` column. A SKU can map to
+        //    several product_ids (multilingual duplicates, accidental copies).
+        $lookup_rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT product_id, sku, stock_quantity
+             FROM {$lookup_table}
+             WHERE sku IN ($placeholders)",
+            $skus
+        ));
+
+        if (empty($lookup_rows)) {
             return $products;
         }
-        
-        $placeholders = array_fill(0, count($skus), '%s');
-        $placeholders_str = implode(',', $placeholders);
 
-        // Detect HPOS product meta lookup table and join it in when present so we can
-        // compare against the same source WooCommerce uses for admin/listing queries.
-        $lookup_table = $wpdb->prefix . 'wc_product_meta_lookup';
-        $has_lookup = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $lookup_table)) === $lookup_table;
+        // Map product_id => [sku, lookup_stock] and collect ids for the detail fetches.
+        $by_id = [];
+        foreach ($lookup_rows as $row) {
+            $by_id[(int) $row->product_id] = [
+                'sku' => $row->sku,
+                'lookup_stock' => $row->stock_quantity !== null ? intval($row->stock_quantity) : null,
+            ];
+        }
+        $ids = array_keys($by_id);
+        $id_placeholders = implode(',', array_fill(0, count($ids), '%d'));
 
-        $lookup_select = $has_lookup ? ", lookup.stock_quantity as lookup_stock" : ", NULL as lookup_stock";
-        $lookup_join = $has_lookup
-            ? "LEFT JOIN {$lookup_table} lookup ON sku.post_id = lookup.product_id"
-            : "";
+        // 2. Restrict to the same product types/statuses the original query used.
+        //    Uses the posts PRIMARY key.
+        $valid = $wpdb->get_results($wpdb->prepare(
+            "SELECT ID, post_status FROM {$wpdb->posts}
+             WHERE ID IN ($id_placeholders)
+             AND post_type IN ('product', 'product_variation')
+             AND post_status IN ('publish', 'private')",
+            $ids
+        ));
 
-        // Get SKU, ID, stock, manage_stock, lookup stock, and post_status in one query
+        if (empty($valid)) {
+            return $products;
+        }
+
+        $status_by_id = [];
+        foreach ($valid as $row) {
+            $status_by_id[(int) $row->ID] = $row->post_status;
+        }
+        $valid_ids = array_keys($status_by_id);
+        $valid_placeholders = implode(',', array_fill(0, count($valid_ids), '%d'));
+
+        // 3. Fetch _stock and _manage_stock for the valid ids in one query (post_id index).
+        $meta = [];
+        $meta_rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT post_id, meta_key, meta_value FROM {$wpdb->postmeta}
+             WHERE post_id IN ($valid_placeholders)
+             AND meta_key IN ('_stock', '_manage_stock')",
+            $valid_ids
+        ));
+        foreach ($meta_rows as $row) {
+            $meta[(int) $row->post_id][$row->meta_key] = $row->meta_value;
+        }
+
+        // 4. Assemble the same shape process_batch() expects.
+        foreach ($valid_ids as $id) {
+            $sku = $by_id[$id]['sku'];
+            $stock_raw = isset($meta[$id]['_stock']) ? $meta[$id]['_stock'] : null;
+
+            if (!isset($products[$sku])) {
+                $products[$sku] = [];
+            }
+            $products[$sku][] = [
+                'id' => $id,
+                'stock' => $stock_raw !== null ? intval($stock_raw) : null,
+                'lookup_stock' => $by_id[$id]['lookup_stock'],
+                'manages_stock' => isset($meta[$id]['_manage_stock']) && $meta[$id]['_manage_stock'] === 'yes',
+                'post_status' => $status_by_id[$id],
+            ];
+        }
+
+        return $products;
+    }
+
+    /**
+     * Legacy postmeta-driven SKU resolution (used when no HPOS lookup table exists).
+     */
+    private function get_products_by_skus_via_postmeta($skus) {
+        global $wpdb;
+
+        $products = [];
+        $placeholders_str = implode(',', array_fill(0, count($skus), '%s'));
+
         $query = $wpdb->prepare(
             "SELECT
                 sku.meta_value as sku,
                 sku.post_id as id,
                 stock.meta_value as stock,
                 manage.meta_value as manages_stock,
-                p.post_status
-                {$lookup_select}
+                p.post_status,
+                NULL as lookup_stock
              FROM {$wpdb->postmeta} sku
              INNER JOIN {$wpdb->posts} p ON sku.post_id = p.ID
              LEFT JOIN {$wpdb->postmeta} stock ON sku.post_id = stock.post_id AND stock.meta_key = '_stock'
              LEFT JOIN {$wpdb->postmeta} manage ON sku.post_id = manage.post_id AND manage.meta_key = '_manage_stock'
-             {$lookup_join}
              WHERE sku.meta_key = '_sku'
              AND sku.meta_value IN ($placeholders_str)
              AND p.post_type IN ('product', 'product_variation')
@@ -544,7 +723,7 @@ class WSSC_Sync {
             $products[$row->sku][] = [
                 'id' => intval($row->id),
                 'stock' => $row->stock !== null ? intval($row->stock) : null,
-                'lookup_stock' => isset($row->lookup_stock) && $row->lookup_stock !== null ? intval($row->lookup_stock) : null,
+                'lookup_stock' => $row->lookup_stock !== null ? intval($row->lookup_stock) : null,
                 'manages_stock' => $row->manages_stock === 'yes',
                 'post_status' => $row->post_status,
             ];
@@ -561,15 +740,14 @@ class WSSC_Sync {
             return;
         }
         
-        // Clear WC product cache for affected products only
+        // Clear WC product cache for affected products only.
+        // The store-wide wc_delete_product_transients() flush runs once at the end of
+        // run() rather than per batch, to avoid repeatedly busting the whole catalog.
         foreach ($product_ids as $product_id) {
             wp_cache_delete('product-' . $product_id, 'products');
             wp_cache_delete($product_id, 'posts');
             clean_post_cache($product_id);
         }
-        
-        // Clear transients once
-        wc_delete_product_transients();
     }
     
     /**
@@ -715,10 +893,49 @@ class WSSC_Sync {
      */
     private function get_all_store_products_with_sku() {
         global $wpdb;
-        
+
         $products = [];
-        
-        // Get all products and variations with SKUs (regardless of stock management)
+
+        if ($this->has_lookup_table()) {
+            // HPOS: read SKUs straight from the lookup table, then validate type/status
+            // by primary key. Avoids a full scan of the unindexed postmeta._sku values.
+            $lookup_table = $wpdb->prefix . 'wc_product_meta_lookup';
+            $lookup_rows = $wpdb->get_results(
+                "SELECT product_id, sku FROM {$lookup_table} WHERE sku != ''"
+            );
+
+            if (empty($lookup_rows)) {
+                return $products;
+            }
+
+            $sku_by_id = [];
+            foreach ($lookup_rows as $row) {
+                $sku_by_id[(int) $row->product_id] = $row->sku;
+            }
+            $ids = array_keys($sku_by_id);
+            $id_placeholders = implode(',', array_fill(0, count($ids), '%d'));
+
+            $valid = $wpdb->get_col($wpdb->prepare(
+                "SELECT ID FROM {$wpdb->posts}
+                 WHERE ID IN ($id_placeholders)
+                 AND post_type IN ('product', 'product_variation')
+                 AND post_status IN ('publish', 'private')",
+                $ids
+            ));
+
+            foreach ($valid as $id) {
+                $id = (int) $id;
+                $sku = $sku_by_id[$id];
+                if (!isset($products[$sku])) {
+                    $products[$sku] = [];
+                }
+                $products[$sku][] = $id;
+            }
+
+            return $products;
+        }
+
+        // Legacy fallback: get all products and variations with SKUs from postmeta.
         $query = "
             SELECT pm_sku.meta_value as sku, pm_sku.post_id
             FROM {$wpdb->postmeta} pm_sku
@@ -728,7 +945,7 @@ class WSSC_Sync {
             AND p.post_type IN ('product', 'product_variation')
             AND p.post_status IN ('publish', 'private')
         ";
-        
+
         $results = $wpdb->get_results($query);
 
         // Each SKU maps to a list of product IDs to handle duplicates.

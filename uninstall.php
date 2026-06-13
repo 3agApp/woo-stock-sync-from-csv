@@ -90,6 +90,8 @@ function wssc_uninstall_cleanup() {
         'wssc_last_scheduled',
         'wssc_privatized_products',
         'wssc_watchdog_last_check',
+        // Fallback single-run sync lock (used when MySQL GET_LOCK is unavailable)
+        'wssc_sync_lock',
         // Database
         'wssc_db_version',
     ];

@@ -77,21 +77,18 @@ class WSSC_Ajax {
             }
         }
         set_transient('wssc_last_manual_sync', time(), 60);
-        
-        // Set running status
-        WSSC()->scheduler->set_running(true);
-        
+
+        // Concurrency is guarded by the single-run lock inside run(); the is_running()
+        // pre-check above is only for a friendly message.
         try {
             $result = WSSC()->sync->run_manual_sync();
-            WSSC()->scheduler->set_running(false);
-            
+
             if ($result['success']) {
                 wp_send_json_success($result);
             } else {
                 wp_send_json_error($result);
             }
         } catch (Exception $e) {
-            WSSC()->scheduler->set_running(false);
             wp_send_json_error([
                 'message' => $e->getMessage(),
             ]);

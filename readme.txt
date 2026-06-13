@@ -6,7 +6,7 @@ Tested up to: 6.4
 Requires PHP: 7.4
 WC requires at least: 5.0
 WC tested up to: 8.0
-Stable tag: 1.4.12
+Stable tag: 1.4.13
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -63,6 +63,12 @@ Yes, the plugin supports both simple products and product variations. Each varia
 You can configure this in Settings. Options include: ignore (keep current stock), set stock to 0, or make the product private (and restore when it returns).
 
 == Changelog ==
+
+= 1.4.13 =
+* Fixed: Severe MySQL CPU overload on large stores caused by overlapping stock syncs. The old "is running" guard was a 30-minute transient that expired mid-sync, so every cron tick could launch another full sync on top of one already running, stacking up long-running SKU-lookup queries. Replaced with a real single-run lock (MySQL GET_LOCK, with an atomic wp_options fallback) that spans the entire sync and is shared by the scheduled, manual, and any other entry points. The lock auto-releases if the process dies, so it can never get stuck.
+* Added: Wall-clock runtime cap (default 20 minutes, filterable via `wssc_max_runtime`) replacing `set_time_limit(0)`, so a single run can no longer execute for hours. A time-capped run logs a warning and finishes the remaining rows on the next run (missing-SKU zero/private actions are skipped on capped runs to avoid acting on an incomplete view).
+* Performance: The per-batch SKU lookup now resolves SKUs through the indexed `sku` column of the HPOS `wc_product_meta_lookup` table (falling back to the legacy postmeta query only when that table is absent), eliminating the unindexed `wp_postmeta.meta_value IN (...)` scan and its triple self-join.
+* Performance: The store-wide `wc_delete_product_transients()` cache flush now runs once per sync instead of once per 100-row batch, and the `wc_product_meta_lookup` existence check is detected once per request instead of on every product update.
 
 = 1.4.12 =
 * Fixed: When the same SKU was used by more than one product (e.g. multilingual duplicates from WPML/Polylang), only one product was updated per sync and the others kept their old stock. Sync now updates every product carrying the SKU, in both the CSV-matched batch path and the "Set missing SKUs to 0" path.

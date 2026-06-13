@@ -10,11 +10,26 @@ if (!defined('ABSPATH')) {
 }
 
 class WSSC_Scheduler {
-    
+
+    /**
+     * MySQL named-lock identifier used to guarantee a single concurrent sync.
+     */
+    const LOCK_NAME = 'wssc_sync_lock';
+
+    /**
+     * wp_options row name used for the fallback lock when GET_LOCK is unavailable.
+     */
+    const OPTION_LOCK_NAME = 'wssc_sync_lock';
+
     /**
      * Available schedule intervals (includes custom + WordPress built-ins)
      */
     private $intervals = [];
+
+    /**
+     * How the currently held lock was acquired ('mysql', 'option', or null).
+     */
+    private $lock_method = null;
     
     /**
      * Constructor
@@ -321,20 +336,122 @@ class WSSC_Scheduler {
     }
     
     /**
-     * Check if sync is currently running
+     * Acquire the single-run sync lock.
+     *
+     * Primary mechanism is the MySQL named lock GET_LOCK(), which is scoped to the
+     * current DB connection and is released automatically if the PHP process / DB
+     * connection dies — so a killed sync never leaves a stale lock behind. When
+     * GET_LOCK is unavailable (returns NULL on some clustered/managed hosts) we fall
+     * back to an atomic wp_options row lock with stale takeover.
+     *
+     * @return bool True if the lock was acquired (caller MUST call release_lock()).
+     */
+    public function acquire_lock() {
+        global $wpdb;
+
+        // 0s timeout: do not wait, fail fast if another connection holds the lock.
+        $result = $wpdb->get_var($wpdb->prepare("SELECT GET_LOCK(%s, 0)", self::LOCK_NAME));
+
+        if ((string) $result === '1') {
+            $this->lock_method = 'mysql';
+            return true;
+        }
+
+        if ((string) $result === '0') {
+            // Another connection holds the named lock — a sync is already running.
+            return false;
+        }
+
+        // NULL => GET_LOCK errored / unsupported. Fall back to the option-row lock.
+        return $this->acquire_option_lock();
+    }
+
+    /**
+     * Fallback atomic lock using a wp_options row (unique option_name index).
+     */
+    private function acquire_option_lock() {
+        global $wpdb;
+
+        $now = time();
+
+        // Atomic test-and-set: the unique key on option_name makes a duplicate INSERT fail.
+        $inserted = $wpdb->query($wpdb->prepare(
+            "INSERT INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+            self::OPTION_LOCK_NAME,
+            (string) $now
+        ));
+
+        if ($inserted) {
+            $this->lock_method = 'option';
+            return true;
+        }
+
+        // A row already exists. Steal it only if the previous holder is clearly dead
+        // (locked longer ago than a full runtime budget plus grace).
+        $stolen = $wpdb->query($wpdb->prepare(
+            "UPDATE {$wpdb->options} SET option_value = %s
+             WHERE option_name = %s AND CAST(option_value AS UNSIGNED) < %d",
+            (string) $now,
+            self::OPTION_LOCK_NAME,
+            $this->lock_stale_before()
+        ));
+
+        if ($stolen) {
+            $this->lock_method = 'option';
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Release the single-run sync lock held by this request.
+     */
+    public function release_lock() {
+        global $wpdb;
+
+        if ($this->lock_method === 'mysql') {
+            $wpdb->get_var($wpdb->prepare("SELECT RELEASE_LOCK(%s)", self::LOCK_NAME));
+        } elseif ($this->lock_method === 'option') {
+            $wpdb->query($wpdb->prepare(
+                "DELETE FROM {$wpdb->options} WHERE option_name = %s",
+                self::OPTION_LOCK_NAME
+            ));
+        }
+
+        $this->lock_method = null;
+    }
+
+    /**
+     * Check if a sync is currently running (authoritative, lock-based).
+     *
+     * Reads the live lock state rather than a TTL transient, so it self-heals: a
+     * crashed sync releases GET_LOCK automatically and a stale option-row lock is
+     * ignored once it ages past the runtime budget.
      */
     public function is_running() {
-        return get_transient('wssc_sync_running') ? true : false;
-    }
-    
-    /**
-     * Set running status
-     */
-    public function set_running($running = true) {
-        if ($running) {
-            set_transient('wssc_sync_running', true, 30 * MINUTE_IN_SECONDS);
-        } else {
-            delete_transient('wssc_sync_running');
+        global $wpdb;
+
+        // IS_USED_LOCK returns the connection id holding the named lock, or NULL.
+        $used = $wpdb->get_var($wpdb->prepare("SELECT IS_USED_LOCK(%s)", self::LOCK_NAME));
+        if ($used !== null) {
+            return true;
         }
+
+        // Fallback path: a non-stale option-row lock means a sync is in progress.
+        $locked_at = $wpdb->get_var($wpdb->prepare(
+            "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s",
+            self::OPTION_LOCK_NAME
+        ));
+
+        return $locked_at !== null && (int) $locked_at >= $this->lock_stale_before();
+    }
+
+    /**
+     * Timestamp before which an option-row lock is considered stale (holder dead).
+     */
+    private function lock_stale_before() {
+        $max_runtime = (int) apply_filters('wssc_max_runtime', WSSC_Sync::MAX_RUNTIME);
+        return time() - ($max_runtime + 5 * MINUTE_IN_SECONDS);
     }
 }
